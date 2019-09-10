@@ -1,23 +1,20 @@
 import torch
-import torchvision.datasets as dset
+import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 import torchvision.models as models
-import numpy as np
 import utils
 import math
 import random
-import torch.nn.functional as F
 import argparse
 import os
-import pdb
 
 parser = argparse.ArgumentParser(description='Runs SimBA on a set of images')
-parser.add_argument('--data_root', type=str, required=True, help='root directory of imagenet data')
+parser.add_argument('--data_root', type=str, default=f'/home/{os.getlogin()}/imagenet', help='root directory of imagenet data')
 parser.add_argument('--result_dir', type=str, default='save', help='directory for saving results')
 parser.add_argument('--sampled_image_dir', type=str, default='save', help='directory to cache sampled images')
 parser.add_argument('--model', type=str, default='resnet50', help='type of base model to use')
-parser.add_argument('--num_runs', type=int, default=1000, help='number of image samples')
-parser.add_argument('--batch_size', type=int, default=50, help='batch size for parallel runs')
+parser.add_argument('--num_runs', type=int, default=1, help='number of image samples')
+parser.add_argument('--batch_size', type=int, default=64, help='batch size for parallel runs')
 parser.add_argument('--num_iters', type=int, default=0, help='maximum number of iterations, 0 for unlimited')
 parser.add_argument('--log_every', type=int, default=10, help='log every n iterations')
 parser.add_argument('--epsilon', type=float, default=0.2, help='step size per iteration')
@@ -156,6 +153,81 @@ def dct_attack_batch(model, images_batch, labels_batch, max_iters, freq_dims, st
     succs[:, max_iters-1] = 1 - remaining
     return x, probs, succs, queries, l2_norms, linf_norms
 
+
+def torch_normalize():
+    imagenet_mean = [0.485, 0.456, 0.406]
+    imagenet_std = [0.229, 0.224, 0.225]
+
+    normalize = transforms.Normalize(mean=imagenet_mean, std=imagenet_std)
+    return normalize
+
+def get_transform_test(size=224, start_size=256):
+    transformations = []
+    transformations.append(transforms.Resize(start_size))
+    transformations.append(transforms.CenterCrop(size))
+    transformations.append(transforms.ToTensor())
+    # transformations.append(torch_normalize())
+    transform_test = transforms.Compose(transformations)
+    return transform_test
+
+
+def get_transform_train(size=224):
+    transformations = []
+    transformations.append(transforms.RandomResizedCrop(size))
+    transformations.append(transforms.RandomHorizontalFlip())
+    transformations.append(transforms.ToTensor())
+    # transformations.append(torch_normalize())
+    transform_train = transforms.Compose(transformations)
+    return transform_train
+
+
+def load_imagenet(imagenet_path="~/imagenet", pin_memory=True, sample_count=0,
+                  distributed=False, batch_size=64, workers=4, is_train=False,
+                  is_test=True):
+
+    train_dataset = None
+    train_loader = None
+    if is_train:
+        traindir = os.path.join(imagenet_path, 'train')
+        train_dataset = datasets.ImageFolder(traindir, get_transform_train())
+
+        if sample_count > 0:
+            train_dataset.imgs = train_dataset.imgs[:sample_count]
+            train_dataset.samples = train_dataset.samples[:sample_count]
+            train_dataset.classes = train_dataset.classes[:sample_count]
+
+        if distributed:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(
+                train_dataset)
+            train_sampler.num_samples = sample_count
+        else:
+            train_sampler = None
+
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=batch_size,
+            shuffle=(train_sampler is None),
+            # has to be False if train_sampler provided
+            num_workers=workers, pin_memory=pin_memory, sampler=train_sampler)
+        # train_loader.batch_sampler.sampler.num_samples = sample_count
+
+    val_dataset = None
+    val_loader = None
+    if is_test:
+        valdir = os.path.join(imagenet_path, 'val')
+        val_dataset = datasets.ImageFolder(valdir, get_transform_test())
+
+        if sample_count > 0:
+            val_dataset.imgs = val_dataset.imgs[:sample_count]
+            val_dataset.samples = val_dataset.samples[:sample_count]
+            val_dataset.classes = val_dataset.classes[:sample_count]
+
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False,
+            num_workers=workers, pin_memory=pin_memory)
+
+    return train_loader, val_loader, train_dataset, val_dataset
+
+
 if not os.path.exists(args.result_dir):
     os.mkdir(args.result_dir)
 if not os.path.exists(args.sampled_image_dir):
@@ -171,6 +243,12 @@ else:
     image_size = 224
     #testset = dset.ImageFolder(args.data_root + '/val', utils.IMAGENET_TRANSFORM)
 
+# sample_count=args.num_runs
+sample_count=100
+train_loader, test_loader, trainset, testset = load_imagenet(
+    imagenet_path=args.data_root, pin_memory=True, sample_count=sample_count,
+                  distributed=False, batch_size=args.batch_size, workers=4)
+
 # load sampled images or sample new ones
 # this is to ensure all attacks are run on the same set of correctly classified images
 batchfile = '%s/images_%s_%d.pth' % (args.sampled_image_dir, args.model, args.num_runs)
@@ -182,6 +260,7 @@ else:
     images = torch.zeros(args.num_runs, 3, image_size, image_size)
     labels = torch.zeros(args.num_runs).long()
     preds = labels + 1
+    # Check if the image was classified correctly.
     while preds.ne(labels).sum() > 0:
         idx = torch.arange(0, images.size(0)).long()[preds.ne(labels)]
         for i in list(idx):
